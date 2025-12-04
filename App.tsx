@@ -1,12 +1,14 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Track, LoopMode, AudioState } from './types';
-import { formatTime, parseFileName } from './utils';
+import { formatTime, parseFileName, saveTracksToDB, getTracksFromDB, clearDB } from './utils';
 import { 
   IconPlay, IconPause, IconPrev, IconNext, 
   IconRepeat, IconRepeatOne, IconUpload, IconPlaylist,
-  IconVolume, IconMute
+  IconVolume, IconMute, IconFolder, IconTrash
 } from './components/Icons';
 import { AmbientBackdrop } from './components/Visualizer';
+
+const ACCEPTED_EXTENSIONS = ".mp3,.wav,.ogg,.m4a,.flac";
 
 const App: React.FC = () => {
   // State
@@ -14,6 +16,7 @@ const App: React.FC = () => {
   const [currentTrackIndex, setCurrentTrackIndex] = useState<number>(-1);
   const [loopMode, setLoopMode] = useState<LoopMode>(LoopMode.All);
   const [showPlaylist, setShowPlaylist] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
   
   const [audioState, setAudioState] = useState<AudioState>({
     isPlaying: false,
@@ -25,31 +28,81 @@ const App: React.FC = () => {
   // Refs
   const audioRef = useRef<HTMLAudioElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
 
   // Derived state
   const currentTrack = currentTrackIndex >= 0 ? playlist[currentTrackIndex] : null;
 
+  // Persistence Load
+  useEffect(() => {
+    const loadSavedTracks = async () => {
+      try {
+        const saved = await getTracksFromDB();
+        if (saved && saved.length > 0) {
+          setPlaylist(saved);
+          setCurrentTrackIndex(0);
+        }
+      } catch (e) {
+        console.error("Failed to load library", e);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+    loadSavedTracks();
+  }, []);
+
   // Handlers
-  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const files = event.target.files;
-    if (files && files.length > 0) {
-      const newTracks: Track[] = Array.from(files).map((file) => {
+  const processFiles = (fileList: FileList) => {
+    const validFiles = Array.from(fileList).filter(file => {
+      // Basic check for audio types or extensions
+      return file.type.startsWith('audio/') || 
+             file.name.endsWith('.m4a') || 
+             file.name.endsWith('.flac') ||
+             file.name.endsWith('.mp3');
+    });
+
+    if (validFiles.length > 0) {
+      const newTracks: Track[] = validFiles.map((file) => {
         const { title, artist } = parseFileName(file.name);
         return {
           file,
           url: URL.createObjectURL(file),
-          id: Math.random().toString(36).substr(2, 9),
+          id: Math.random().toString(36).substr(2, 9) + Date.now(),
           title,
           artist
         };
       });
 
-      setPlaylist((prev) => [...prev, ...newTracks]);
+      setPlaylist((prev) => {
+        const updated = [...prev, ...newTracks];
+        return updated;
+      });
       
+      // Save to IndexedDB
+      saveTracksToDB(newTracks);
+
       // If no track is playing, start the first new one
       if (currentTrackIndex === -1) {
         setCurrentTrackIndex(0);
       }
+    }
+  };
+
+  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    if (event.target.files && event.target.files.length > 0) {
+      processFiles(event.target.files);
+    }
+  };
+
+  const handleClearLibrary = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (window.confirm("Clear all saved music?")) {
+      await clearDB();
+      // Revoke URLs
+      playlist.forEach(t => URL.revokeObjectURL(t.url));
+      setPlaylist([]);
+      setCurrentTrackIndex(-1);
+      setAudioState(prev => ({...prev, isPlaying: false, currentTime: 0, duration: 0}));
     }
   };
 
@@ -153,8 +206,6 @@ const App: React.FC = () => {
   // Effects
   useEffect(() => {
     if (currentTrack && audioRef.current) {
-      // Clean up previous logic if needed, but mainly just load new source
-      // Note: In a production app, we should revokeObjectURL when removing tracks
       if (audioRef.current.src !== currentTrack.url) {
         audioRef.current.src = currentTrack.url;
         audioRef.current.load();
@@ -170,35 +221,72 @@ const App: React.FC = () => {
     };
   }, []);
 
-  // UI Components
+  // Initial Loading Screen
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-ink flex items-center justify-center font-serif text-neutral-500">
+        <span className="animate-pulse tracking-widest uppercase text-sm">Loading Library...</span>
+      </div>
+    );
+  }
+
+  // Empty State (No Music)
   if (playlist.length === 0) {
     return (
       <div className="min-h-screen bg-ink flex flex-col items-center justify-center p-6 text-center font-serif relative overflow-hidden">
         <AmbientBackdrop isPlaying={false} />
-        <div className="z-10 animate-pulse-slow">
-            <IconUpload />
-        </div>
-        <h1 className="text-3xl md:text-4xl text-neutral-200 mb-6 font-light tracking-widest z-10">
-          Upload Local Music
+        
+        <h1 className="text-3xl md:text-4xl text-neutral-200 mb-2 font-light tracking-widest z-10">
+          Zen Audio
         </h1>
-        <p className="text-neutral-500 mb-12 max-w-md z-10">
-          Select audio files from your device to begin.
-          <br/>Your music stays on your device.
+        <p className="text-neutral-500 mb-12 z-10 text-sm tracking-wide">
+          Your Local Music Sanctuary
         </p>
-        <button 
-          onClick={() => fileInputRef.current?.click()}
-          className="z-10 px-8 py-3 border border-neutral-700 hover:border-neutral-400 hover:bg-neutral-900 transition-all text-neutral-300 tracking-widest uppercase text-sm"
-        >
-          Select Files
-        </button>
+
+        <div className="flex flex-col md:flex-row gap-6 z-10">
+            {/* File Upload */}
+            <button 
+            onClick={() => fileInputRef.current?.click()}
+            className="group flex flex-col items-center justify-center w-40 h-40 border border-neutral-800 hover:border-neutral-600 hover:bg-white/5 transition-all duration-500 rounded-sm"
+            >
+                <div className="transform group-hover:-translate-y-1 transition-transform duration-500">
+                    <IconUpload />
+                </div>
+                <span className="text-neutral-400 text-xs uppercase tracking-widest mt-4">Select Files</span>
+            </button>
+
+            {/* Folder Upload */}
+            <button 
+            onClick={() => folderInputRef.current?.click()}
+            className="group flex flex-col items-center justify-center w-40 h-40 border border-neutral-800 hover:border-neutral-600 hover:bg-white/5 transition-all duration-500 rounded-sm"
+            >
+                <div className="transform group-hover:-translate-y-1 transition-transform duration-500">
+                    <IconFolder />
+                </div>
+                <span className="text-neutral-400 text-xs uppercase tracking-widest mt-4">Select Folder</span>
+            </button>
+        </div>
+
         <input 
           type="file" 
           ref={fileInputRef} 
           onChange={handleFileUpload} 
-          accept="audio/*" 
+          accept={ACCEPTED_EXTENSIONS}
           multiple 
           className="hidden" 
         />
+        <input 
+          type="file" 
+          ref={folderInputRef} 
+          onChange={handleFileUpload} 
+          {...{ webkitdirectory: "", mozdirectory: "", directory: "" } as any}
+          className="hidden" 
+        />
+        
+        <p className="mt-12 text-neutral-600 text-xs max-w-xs leading-relaxed z-10">
+            Supports MP3, FLAC, M4A, WAV. <br/>
+            Music is saved locally in your browser.
+        </p>
       </div>
     );
   }
@@ -224,20 +312,22 @@ const App: React.FC = () => {
              <button 
                 onClick={() => setShowPlaylist(!showPlaylist)}
                 className="text-neutral-500 hover:text-white transition-colors"
+                title="Playlist"
             >
                 <IconPlaylist />
             </button>
+            <div className="h-4 w-[1px] bg-neutral-800 my-auto"></div>
              <button 
                 onClick={() => fileInputRef.current?.click()}
-                className="text-neutral-500 hover:text-white transition-colors"
+                className="text-neutral-500 hover:text-white transition-colors text-xs uppercase tracking-wider"
             >
-                <span className="text-xs border border-neutral-700 px-2 py-1">+ Add</span>
+                Add Files
             </button>
             <input 
                 type="file" 
                 ref={fileInputRef} 
                 onChange={handleFileUpload} 
-                accept="audio/*" 
+                accept={ACCEPTED_EXTENSIONS}
                 multiple 
                 className="hidden" 
             />
@@ -248,8 +338,19 @@ const App: React.FC = () => {
       {showPlaylist && (
          <div className="absolute inset-0 bg-ink/95 backdrop-blur-xl z-30 flex flex-col p-8 animate-in fade-in duration-200">
             <div className="flex justify-between items-center mb-8 border-b border-white/10 pb-4">
-                <h2 className="text-xl tracking-widest text-white/80">Queue</h2>
-                <button onClick={() => setShowPlaylist(false)} className="text-sm text-neutral-500 hover:text-white">CLOSE</button>
+                <div className="flex items-center gap-4">
+                    <h2 className="text-xl tracking-widest text-white/80">Queue</h2>
+                    <span className="text-xs text-neutral-600 bg-neutral-900 px-2 py-1 rounded-full">{playlist.length} Tracks</span>
+                </div>
+                <div className="flex items-center gap-6">
+                    <button 
+                        onClick={handleClearLibrary}
+                        className="flex items-center gap-2 text-xs text-neutral-600 hover:text-red-400 transition-colors uppercase tracking-wider"
+                    >
+                        <IconTrash /> Clear Library
+                    </button>
+                    <button onClick={() => setShowPlaylist(false)} className="text-sm text-neutral-500 hover:text-white">CLOSE</button>
+                </div>
             </div>
             <div className="flex-1 overflow-y-auto space-y-2 pr-2">
                 {playlist.map((track, idx) => (
@@ -264,8 +365,9 @@ const App: React.FC = () => {
                         <div className={`text-lg mb-1 ${idx === currentTrackIndex ? 'text-white' : 'text-neutral-400 group-hover:text-neutral-200'}`}>
                             {track.title}
                         </div>
-                        <div className="text-xs uppercase tracking-wider text-neutral-600">
-                            {track.artist}
+                        <div className="text-xs uppercase tracking-wider text-neutral-600 flex justify-between">
+                            <span>{track.artist}</span>
+                            {idx === currentTrackIndex && <span className="text-white/40 animate-pulse">Playing</span>}
                         </div>
                     </div>
                 ))}
@@ -275,31 +377,26 @@ const App: React.FC = () => {
 
       {/* Main Display Area */}
       <div className="flex-1 flex flex-col items-center justify-center z-10 px-6">
-        {/* Decorative elements based on user image */}
         <div className="flex flex-col items-center gap-8 max-w-2xl w-full">
-            
-            {/* The "Lyrics" / Title Display */}
             <div className="text-center space-y-8 select-none">
                  {/* Previous context (faded) */}
-                <div className="h-8 text-neutral-700 text-lg transition-all duration-700 transform">
-                    {/* Placeholder for previous lyric line style */}
-                     Wait for the sound
+                <div className="h-8 text-neutral-800 text-lg transition-all duration-700 transform font-display">
+                    ✦
                 </div>
 
                 {/* Main Focus */}
                 <div className="space-y-6 py-4">
-                    <h1 className="text-4xl md:text-6xl font-normal tracking-tight text-white leading-tight animate-in slide-in-from-bottom-2 fade-in duration-700">
+                    <h1 className="text-3xl md:text-5xl lg:text-6xl font-normal tracking-tight text-white leading-tight animate-in slide-in-from-bottom-2 fade-in duration-700">
                         {currentTrack?.title}
                     </h1>
-                    <p className="text-xl md:text-2xl text-neutral-400 font-light tracking-wide animate-in slide-in-from-bottom-3 fade-in duration-1000 delay-100">
+                    <p className="text-lg md:text-xl text-neutral-400 font-light tracking-[0.2em] uppercase animate-in slide-in-from-bottom-3 fade-in duration-1000 delay-100">
                         {currentTrack?.artist}
                     </p>
                 </div>
 
                 {/* Next context (faded) */}
-                <div className="h-8 text-neutral-700 text-lg transition-all duration-700 transform">
-                    {/* Placeholder for next lyric line style */}
-                     Echoes in the deep
+                <div className="h-8 text-neutral-800 text-lg transition-all duration-700 transform font-display">
+                    ✦
                 </div>
             </div>
 
@@ -339,7 +436,7 @@ const App: React.FC = () => {
         </div>
 
         {/* Buttons */}
-        <div className="flex items-center justify-center gap-10 md:gap-16">
+        <div className="flex items-center justify-center gap-8 md:gap-16">
           <button 
             onClick={toggleLoopMode}
             className="p-2 rounded-full hover:bg-white/5 transition-all"
